@@ -19,17 +19,10 @@ const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 const ESC_RE = /[&<>"']/g;
 
-/** `s` with & < > " ' escaped, pushed into `out` (no intermediate string). */
-function escInto(out, s) {
-  ESC_RE.lastIndex = 0;
-  let m;
-  let last = 0;
-  while ((m = ESC_RE.exec(s)) !== null) {
-    if (m.index > last) out.push(s.slice(last, m.index));
-    out.push(ESCAPES[m[0]]);
-    last = m.index + 1;
-  }
-  if (last < s.length) out.push(s.slice(last));
+/** `s` with & < > " ' escaped, as one string (String.replace is native and
+ * atomic, so no lastIndex bookkeeping is needed across the recursion). */
+function escStr(s) {
+  return s.replace(ESC_RE, (c) => ESCAPES[c]);
 }
 
 /** Whitespace code units (what /\s/ matches), as a table for fast scans. */
@@ -72,47 +65,46 @@ const SLUG_MAX = 64;
  * The slug of `text`: NFKD, combining marks dropped, A-Z lowered, every run
  * of characters other than a-z and 0-9 one "-", none at either end, at most
  * SLUG_MAX characters (a "-" left at the cut dropped), "untitled" when
- * nothing is left. Pure ASCII text skips the normalisation entirely.
+ * nothing is left. Pure ASCII text is slugified in a single pass; the first
+ * non-ASCII character bails to the normalising path on the whole text.
  */
 function slugifyRaw(text) {
-  let plain = text;
-  let ascii = true;
-  for (let i = 0; i < text.length; i++) {
-    if (text.charCodeAt(i) >= 128) {
-      ascii = false;
-      break;
-    }
-  }
-  if (!ascii) plain = text.normalize('NFKD').replace(COMBINING, '');
   let out = '';
   let gap = false;
-  if (ascii) {
-    for (let i = 0; i < plain.length; i++) {
-      const c = plain.charCodeAt(i);
-      let keep = -1;
-      if (c >= 65 && c <= 90) keep = c + 32;
-      else if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) keep = c;
-      if (keep === -1) {
-        gap = out.length > 0;
-        continue;
-      }
-      if (gap) out += '-';
-      gap = false;
-      out += String.fromCharCode(keep);
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c >= 128) return slugifyWide(text);
+    let keep = -1;
+    if (c >= 65 && c <= 90) keep = c + 32;
+    else if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) keep = c;
+    if (keep === -1) {
+      gap = out.length > 0;
+      continue;
     }
-  } else {
-    for (const ch of plain) {
-      let keep = null;
-      if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
-      else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
-      if (keep === null) {
-        gap = out.length > 0;
-        continue;
-      }
-      if (gap) out += '-';
-      gap = false;
-      out += keep;
+    if (gap) out += '-';
+    gap = false;
+    out += String.fromCharCode(keep);
+  }
+  out = out.slice(0, SLUG_MAX).replace(/-+$/, '');
+  return out === '' ? 'untitled' : out;
+}
+
+/** slugifyRaw for text holding a non-ASCII character (see slugifyRaw). */
+function slugifyWide(text) {
+  const plain = text.normalize('NFKD').replace(COMBINING, '');
+  let out = '';
+  let gap = false;
+  for (const ch of plain) {
+    let keep = null;
+    if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
+    else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
+    if (keep === null) {
+      gap = out.length > 0;
+      continue;
     }
+    if (gap) out += '-';
+    gap = false;
+    out += keep;
   }
   out = out.slice(0, SLUG_MAX).replace(/-+$/, '');
   return out === '' ? 'untitled' : out;
@@ -470,34 +462,48 @@ function trailingBlank(line, from) {
   return true;
 }
 
-/** The first index from `from` where `s` holds `what` outside an escape, or -1. */
+/**
+ * The first index from `from` where `s` holds `what` outside an escape, or
+ * -1. Candidates come from indexOf; a candidate is escaped exactly when an
+ * odd run of backslashes ends just before it (backslashes pair left to
+ * right, and `what`'s first character is one a backslash escapes for both
+ * callers, '*' and ']'), and the run cannot reach past `from`, whose
+ * preceding character is the opening '*' or '['.
+ */
 function findUnescaped(s, what, from) {
-  for (let j = from; j <= s.length - what.length; j++) {
-    if (s.charCodeAt(j) === 92 && j + 1 < s.length && isEscapableCode(s.charCodeAt(j + 1))) {
-      j++;
-      continue;
-    }
-    if (s.startsWith(what, j)) return j;
+  let j = from;
+  for (;;) {
+    const k = s.indexOf(what, j);
+    if (k === -1) return -1;
+    let m = 0;
+    for (let p = k - 1; p >= from && s.charCodeAt(p) === 92; p--) m++;
+    if (m % 2 === 0) return k;
+    j = k + 1;
   }
-  return -1;
 }
 
-/** The first single * from `from` (one whose run is not **), outside an escape, or -1. */
+/**
+ * The first single * from `from` (one whose run is not **), outside an
+ * escape, or -1. Candidates come from indexOf; the escape test is the same
+ * odd-backslash-run rule as findUnescaped.
+ */
 function findSingleStar(s, from) {
-  for (let j = from; j < s.length; j++) {
-    const c = s.charCodeAt(j);
-    if (c === 92 && j + 1 < s.length && isEscapableCode(s.charCodeAt(j + 1))) {
-      j++;
+  let j = from;
+  for (;;) {
+    const k = s.indexOf('*', j);
+    if (k === -1) return -1;
+    let m = 0;
+    for (let p = k - 1; p >= from && s.charCodeAt(p) === 92; p--) m++;
+    if (m % 2 === 1) {
+      j = k + 1;
       continue;
     }
-    if (c !== 42) continue;
-    if (s.charCodeAt(j + 1) === 42) {
-      j++;
+    if (s.charCodeAt(k + 1) === 42) {
+      j = k + 2;
       continue;
     }
-    return j;
+    return k;
   }
-  return -1;
 }
 
 /** Whether `target` holds whitespace. */
@@ -536,9 +542,7 @@ function inlineInto(out, s, link) {
       const j = s.indexOf('`', i + 1);
       if (j > i + 1) {
         if (i > start) out.push(s.slice(start, i));
-        out.push('<code>');
-        escInto(out, s.slice(i + 1, j));
-        out.push('</code>');
+        out.push('<code>', escStr(s.slice(i + 1, j)), '</code>');
         INLINE_SPECIAL.lastIndex = j + 1;
         start = j + 1;
       }
@@ -578,9 +582,7 @@ function inlineInto(out, s, link) {
       const target = mm === -1 ? '' : s.slice(k + 2, mm);
       if (target !== '' && !hasWS(target)) {
         if (i > start) out.push(s.slice(start, i));
-        out.push('<a href="');
-        escInto(out, link(target));
-        out.push('">');
+        out.push('<a href="', escStr(link(target)), '">');
         inlineInto(out, s.slice(i + 1, k), link);
         out.push('</a>');
         INLINE_SPECIAL.lastIndex = mm + 1;
@@ -632,15 +634,10 @@ function renderMarkdown(src, link, slugify) {
         i++;
         const parts = ['<pre><code'];
         if (lang !== '') {
-          parts.push(' class="language-');
-          escInto(parts, lang);
-          parts.push('"');
+          parts.push(' class="language-', escStr(lang), '"');
         }
         parts.push('>');
-        for (const l of body) {
-          escInto(parts, l);
-          parts.push('\n');
-        }
+        if (body.length !== 0) parts.push(escStr(body.join('\n')), '\n');
         parts.push('</code></pre>\n');
         out.push(parts.join(''));
         continue;
@@ -913,7 +910,7 @@ function truthy(v) {
 
 /** `v` as text, escaped, pushed into `O`. */
 function escPush(O, v) {
-  escInto(O, typeof v === 'string' ? v : textOf(v));
+  O.push(escStr(typeof v === 'string' ? v : textOf(v)));
 }
 
 
@@ -1077,7 +1074,7 @@ function build(input) {
   const sources = [];
   const statics = [];
   for (const f of files) {
-    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.replace(/\r\n?/g, '\n') });
+    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.includes('\r') ? f.content.replace(/\r\n?/g, '\n') : f.content });
     else statics.push({ path: f.path, content: f.content });
   }
 
