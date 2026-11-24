@@ -184,6 +184,9 @@ function daysIn(y, m) {
 function stringOf(raw) {
   if (raw.charCodeAt(0) === 34) {
     if (raw.length < 2 || raw.charCodeAt(raw.length - 1) !== 34) return { error: 'a quoted string is not closed' };
+    // Fast path: no backslash and no quote before the closing one, so the
+    // value is the inside as written (the two indexOf scans are native).
+    if (raw.indexOf('\\', 1) === -1 && raw.indexOf('"', 1) === raw.length - 1) return { value: raw.slice(1, -1) };
     let out = '';
     for (let i = 1; i < raw.length - 1; i++) {
       const c = raw[i];
@@ -632,14 +635,13 @@ function renderMarkdown(src, link, slugify) {
           i++;
         }
         i++;
-        const parts = ['<pre><code'];
+        out.push('<pre><code');
         if (lang !== '') {
-          parts.push(' class="language-', escStr(lang), '"');
+          out.push(' class="language-', escStr(lang), '"');
         }
-        parts.push('>');
-        if (body.length !== 0) parts.push(escStr(body.join('\n')), '\n');
-        parts.push('</code></pre>\n');
-        out.push(parts.join(''));
+        out.push('>');
+        if (body.length !== 0) out.push(escStr(body.join('\n')), '\n');
+        out.push('</code></pre>\n');
         continue;
       }
     } else if (c0 === 35) {
@@ -674,14 +676,13 @@ function renderMarkdown(src, link, slugify) {
             i++;
           } else break;
         }
-        const parts = ['<ul>\n'];
+        out.push('<ul>\n');
         for (const item of items) {
-          parts.push('<li>');
-          inlineInto(parts, item.join('\n'), link);
-          parts.push('</li>\n');
+          out.push('<li>');
+          inlineInto(out, item.join('\n'), link);
+          out.push('</li>\n');
         }
-        parts.push('</ul>\n');
-        out.push(parts.join(''));
+        out.push('</ul>\n');
         continue;
       }
     } else if (c0 === 62) {
@@ -714,14 +715,13 @@ function renderMarkdown(src, link, slugify) {
             i++;
           } else break;
         }
-        const parts = [o.start !== 1 ? `<ol start="${o.start}">\n` : '<ol>\n'];
+        out.push(o.start !== 1 ? `<ol start="${o.start}">\n` : '<ol>\n');
         for (const item of items) {
-          parts.push('<li>');
-          inlineInto(parts, item.join('\n'), link);
-          parts.push('</li>\n');
+          out.push('<li>');
+          inlineInto(out, item.join('\n'), link);
+          out.push('</li>\n');
         }
-        parts.push('</ol>\n');
-        out.push(parts.join(''));
+        out.push('</ol>\n');
         continue;
       }
     }
@@ -941,15 +941,44 @@ function genNodes(nodes, scope, ctx) {
       code += `{const X${id}=${genPath(scope, n.path)};if(Array.isArray(X${id})){const ${sv}=Object.create(${scope});const L${id}={index:0,first:false,last:false,length:X${id}.length};for(let K${id}=0;K${id}<X${id}.length;K${id}++){${sv}[${JSON.stringify(n.name)}]=X${id}[K${id}];${sv}.loop=L${id};L${id}.index=K${id}+1;L${id}.first=K${id}===0;L${id}.last=K${id}===X${id}.length-1;${genNodes(n.body, sv, ctx)}}}}`;
     } else if (n.kind === 'include') {
       const id = ctx.next++;
-      code += `if(D<8){const F${id}=F[${JSON.stringify(n.name)}];if(F${id}!==undefined)F${id}(${scope},D+1,O);}`;
+      // A memoized include: when the included template's output is fixed
+      // by exactly one root that is not a case constant (site, tags and
+      // recent are the same for every render of a case), a render of it
+      // for that root value is reused. The cached string is a complete
+      // render only while the callee's depth plus its longest include
+      // chain fits the depth budget (the callee runs at D+1, so the caller
+      // needs D + maxK <= 7); at a deeper caller depth the render is cut
+      // short by the depth rule and is neither cached nor reused. A cycle
+      // (maxK 99) or a template that reads `loop` never memoizes.
+      const inf = ctx.info === undefined ? undefined : ctx.info.get(n.name);
+      let memoRoot = null;
+      if (inf !== undefined && inf.maxK < 99) {
+        let count = 0;
+        for (const r of inf.roots) {
+          if (r === 'site' || r === 'tags' || r === 'recent' || r === 'loop') continue;
+          count++;
+          memoRoot = r;
+        }
+        if (count !== 1) memoRoot = null;
+      }
+      if (memoRoot === null) {
+        code += `if(D<8){const F${id}=F[${JSON.stringify(n.name)}];if(F${id}!==undefined)F${id}(${scope},D+1,O);}`;
+      } else {
+        const nm = JSON.stringify(n.name);
+        const rt = JSON.stringify(memoRoot);
+        const mk = inf.maxK;
+        code += `if(D<8){const F${id}=F[${nm}];if(F${id}!==undefined){const K${id}=${scope}[${rt}];let MM${id}=M[${nm}];if(MM${id}===undefined){MM${id}=new Map();M[${nm}]=MM${id};}let H${id}=MM${id}.get(K${id});if(H${id}!==undefined&&D+${mk}<=7){O.push(H${id});}else if(D+${mk}<=7){const A${id}=[];F${id}(${scope},D+1,A${id});H${id}=A${id}.join('');MM${id}.set(K${id},H${id});O.push(H${id});}else{F${id}(${scope},D+1,O);}}}`;
+      }
     }
   }
   return code;
 }
 
-/** A template's nodes compiled to a render function (S, D, O). */
-function compileTemplate(body, F) {
-  const src = genNodes(body, 'S', { next: 0 });
+/** A template's nodes compiled to a render function (S, D, O). `info` is the
+ * templates' root analysis (for the include memo) and `M` the case's memo
+ * store, a plain object of template name to Map. */
+function compileTemplate(body, F, info, M) {
+  const src = genNodes(body, 'S', { next: 0, info });
   const maker = new Function(
     'textOf',
     'escPush',
@@ -959,9 +988,10 @@ function compileTemplate(body, F) {
     'get4',
     'getN',
     'F',
+    'M',
     `"use strict";return function(S,D,O){${src}}`,
   );
-  return maker(textOf, escPush, truthy, get2, get3, get4, getN, F);
+  return maker(textOf, escPush, truthy, get2, get3, get4, getN, F, M);
 }
 
 /**
@@ -1061,8 +1091,12 @@ function build(input) {
   const templateInfo = analyzeTemplates(parsed);
   const F = Object.create(null);
   const templates = new Map();
+  // One include-memo store per case: template name to Map, keyed by the one
+  // root value that fixes the template's output (see genNodes). It is made
+  // fresh here, so nothing is carried from one case to the next.
+  const memo = Object.create(null);
   for (const [name, nodes] of parsed) {
-    const fn = compileTemplate(nodes, F);
+    const fn = compileTemplate(nodes, F, templateInfo, memo);
     F[name] = fn;
     templates.set(name, fn);
   }
@@ -1172,6 +1206,9 @@ function build(input) {
       let tag = bySlug.get(slug);
       if (tag === undefined) {
         tag = { name, slug, url: `${base}/tags/${slug}/`, posts: [] };
+        // One shared { name, slug, url } for every card that shows this
+        // tag: the lists read those three fields and nothing else.
+        tag.view = { name, slug, url: tag.url };
         bySlug.set(slug, tag);
       }
       tag.posts.push(p);
@@ -1210,19 +1247,24 @@ function build(input) {
     summary: s.data.summary ?? '',
     excerpt: s.excerpt,
     reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
-    tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
+    tags: s.tagRefs.map((t) => (t.view !== undefined ? t.view : { name: t.name, slug: t.slug, url: t.url })),
   });
   const pageOf = (s) => {
     if (s.card === undefined) s.card = cardOf(s);
-    return {
-      ...s.card,
-      slug: s.slug,
-      content: s.html,
-      toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
-      newer: linkOf(s.newer ?? null),
-      older: linkOf(s.older ?? null),
-      is_post: s.post,
-    };
+    // The page is its card with the page fields added in place: the card
+    // object is this source's own (made above, or for a post in the cards
+    // loop), and the lists that reuse it read only the card's own fields,
+    // so the added ones change no list's output. The toc entries are
+    // already { level, id, html }, exactly the shape the layout reads, so
+    // no copy of the table is made.
+    const c = s.card;
+    c.slug = s.slug;
+    c.content = s.html;
+    c.toc = s.toc;
+    c.newer = linkOf(s.newer ?? null);
+    c.older = linkOf(s.older ?? null);
+    c.is_post = s.post;
+    return c;
   };
 
   // Layouts: every page through its layout, the index and tag pages.
